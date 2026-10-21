@@ -1,0 +1,3 @@
+# Illustrator が日本語を正しく読めるよう、BOM 付き UTF-8 / CRLF のまま保持
+*.jsx text eol=crlf
+*.png binary
