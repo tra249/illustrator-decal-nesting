@@ -85,15 +85,19 @@ var DN = (function () {
     }
 
     function finishMask(mk) {
-        var need = [], firstK = -1, widest = 0;
+        var need = [], firstK = -1, widest = 0, total = 0;
         for (var k = 0; k < mk.rows; k++) {
             var r = mk.runs[k], mxl = 0;
-            for (var t = 0; t < r.length; t += 2) if (r[t + 1] - r[t] + 1 > mxl) mxl = r[t + 1] - r[t] + 1;
+            for (var t = 0; t < r.length; t += 2) {
+                var len = r[t + 1] - r[t] + 1;
+                total += len;
+                if (len > mxl) mxl = len;
+            }
             need.push(mxl);
             if (mxl > need[widest]) widest = k;
             if (firstK < 0 && r.length) firstK = k;
         }
-        mk.need = need; mk.widest = widest; mk.firstK = firstK < 0 ? 0 : firstK;
+        mk.need = need; mk.widest = widest; mk.firstK = firstK < 0 ? 0 : firstK; mk.total = total;
         return mk;
     }
 
@@ -195,27 +199,23 @@ var DN = (function () {
         }
     }
 
-    function nestOnce(order, items, bins) {
+    function nestOnce(order, items, bins, ctx) {
         var place = [], nUn = 0, bi;
         for (var i = 0; i < order.length; i++) {
             var idx = order[i], it = items[idx], done = false;
             for (bi = 0; bi < bins.length && !done; bi++) {
-                var bin = bins[bi], ms = it.masks[bin.mode], best = null, lim = bin.P;
-                for (var o = 0; o < ms.length; o++) {
-                    var pos = findPos(bin, ms[o], lim);
-                    if (!pos) continue;
-                    var far = pos.p + ms[o].rows;
-                    if (!best || far < best.far ||
-                        (far === best.far && (pos.p < best.p || (pos.p === best.p && pos.q < best.q)))) {
-                        best = { o: o, p: pos.p, q: pos.q, far: far };
-                        lim = far;
-                    }
+                var bin = bins[bi];
+                // 粗い刻みで全周を探索してから、最良角の周辺だけを細かく再探索する
+                var best = ctx.scan(bin, it, ctx.angles, null);
+                if (best && ctx.refine) {
+                    var fl = ctx.fineList(it, best.mk.ang, ctx.step);
+                    if (fl) best = ctx.scan(bin, it, fl, best);
                 }
                 if (best) {
-                    occupy(bin, ms[best.o], best.p, best.q);
+                    occupy(bin, best.mk, best.p, best.q);
                     if (best.far > bin.far) bin.far = best.far;
                     bin.used = true;
-                    place[idx] = { bin: bin, binIndex: bi, o: best.o, p: best.p, q: best.q };
+                    place[idx] = { bin: bin, binIndex: bi, mk: best.mk, p: best.p, q: best.q };
                     done = true;
                 }
             }
@@ -224,22 +224,37 @@ var DN = (function () {
         var last = -1;
         for (bi = 0; bi < bins.length; bi++) if (bins[bi].used) last = bi;
         var cost = nUn * 1e9 + (last + 1) * 1e6 + (last >= 0 ? bins[last].far : 0);
-        return { place: place, cost: cost, nUn: nUn };
+        return { place: place, cost: cost, nUn: nUn,
+                 binsUsed: last + 1, far: last >= 0 ? bins[last].far : 0 };
     }
 
-    function perturb(order) {
-        var n = order.length;
-        if (n < 2) return;
-        var sw = Math.max(1, Math.round(n * 0.3));
-        for (var i = 0; i < sw; i++) {
-            var a = Math.floor(Math.random() * (n - 1));
-            var b = Math.min(n - 1, a + 1 + Math.floor(Math.random() * 3));
-            var tmp = order[a]; order[a] = order[b]; order[b] = tmp;
+    // 配置順の候補。乱数は使わないので、同じ設定なら常に同じ結果になる
+    var ORDER_KEYS = ['peri', 'area', 'bbox', 'maxDim', 'diag'];
+    var ORDER_NAMES = { peri: '周長', area: '面積', bbox: '外接矩形', maxDim: '最大寸法', diag: '対角長' };
+
+    function buildPlans(items, opt) {
+        var keys = (opt.order === 'auto') ? ORDER_KEYS : [opt.order];
+        var plans = [], i, k, key;
+        for (k = 0; k < keys.length; k++) {
+            key = keys[k];
+            var o = [];
+            for (i = 0; i < items.length; i++) o.push(i);
+            o.sort(function (x, y) { return items[y].m[key] - items[x].m[key]; });
+            plans.push({ label: ORDER_NAMES[key], order: o });
+            // 深い探索: i 番目の部品を先頭へ繰り上げた並びも試す
+            if (opt.depth > 1) {
+                for (i = 1; i < o.length; i++) {
+                    var v = o.slice(0), t = v.splice(i, 1)[0];
+                    v.unshift(t);
+                    plans.push({ label: ORDER_NAMES[key] + '+繰上' + i, order: v });
+                }
+            }
         }
+        return plans;
     }
 
     // ringsList: パーツごとのリング配列, frameBounds: 枠のgeometricBounds配列
-    // opt: { gap, margin, step, s, trials }（単位 pt / 度）, cb: 進捗コールバック
+    // opt: { gap, margin, step, s, refine, fine, order, depth }（単位 pt / 度）, cb: 進捗コールバック
     function nest(ringsList, frameBounds, opt, cb) {
         var s = opt.s, R = opt.gap / 2 / s, Ri = Math.round(R), i, k, f;
         var modes = [false, false], defs = [];
@@ -249,38 +264,105 @@ var DN = (function () {
             defs.push({ b: b, mode: mode });
             modes[mode] = true;
         }
+        // 回転は常に全周。opt.step はその刻み
         var angles = [];
         for (var a = 0; a < 360 - 1e-6; a += opt.step) angles.push(a);
 
-        var items = [];
-        for (i = 0; i < ringsList.length; i++) {
-            if (cb) cb('形状を解析中… ' + (i + 1) + ' / ' + ringsList.length);
-            var it = { masks: [null, null], area: 0 };
-            for (var m = 0; m < 2; m++) {
-                if (!modes[m]) continue;
-                it.masks[m] = [];
-                for (k = 0; k < angles.length; k++) {
-                    var r = rasterize(ringsList[i], angles[k], m, s);
-                    if (k === 0 && !it.area) it.area = r.cells;
-                    it.masks[m].push(finishMask(dilate(r, R)));
+        // ---- マスクは実際に試す角度だけ生成してキャッシュする ----
+        var DEG = 180 / Math.PI, CACHE_CAP = 240, FINE_MAX = 24;
+
+        function sameRuns(x, y) {
+            for (var k2 = 0; k2 < x.rows; k2++) {
+                var ax = x.runs[k2], ay = y.runs[k2];
+                if (ax.length !== ay.length) return false;
+                for (var t2 = 0; t2 < ax.length; t2++) if (ax[t2] !== ay[t2]) return false;
+            }
+            return true;
+        }
+
+        function getMask(it, mode, ang) {
+            var a = Math.round(ang * 2) / 2 % 360;   // 0.5°に丸めてキーを使い回す
+            if (a < 0) a += 360;
+            var key = mode + ':' + a, mk = it.cache[key];
+            if (mk) return mk;
+            var r = rasterize(it.rings, a, mode, s);
+            if (!it.area) it.area = r.cells;
+            mk = finishMask(dilate(r, R));
+            mk.ang = a;
+            // グリッド解像度未満の回転差で同一形状になったマスクは使い回す
+            var bk = mode + '#' + mk.rows + 'x' + mk.cols + 'x' + mk.total, bu = it.shape[bk], j;
+            if (bu) for (j = 0; j < bu.length; j++) if (sameRuns(bu[j], mk)) { it.cache[key] = bu[j]; return bu[j]; }
+            if (it.n < CACHE_CAP) {
+                if (bu) bu.push(mk); else it.shape[bk] = [mk];
+                it.cache[key] = mk; it.n++;
+            }
+            return mk;
+        }
+
+        // 1つの枠について、与えられた角度リストから最良の配置を選ぶ
+        function scan(bin, it, list, best) {
+            var lim = best ? best.far : bin.P;
+            for (var o = 0; o < list.length; o++) {
+                var mk = getMask(it, bin.mode, list[o]);
+                var pos = findPos(bin, mk, lim);
+                if (!pos) continue;
+                var far = pos.p + mk.rows;
+                if (!best || far < best.far ||
+                    (far === best.far && (pos.p < best.p || (pos.p === best.p && pos.q < best.q)))) {
+                    best = { mk: mk, p: pos.p, q: pos.q, far: far };
+                    lim = far;
                 }
             }
+            return best;
+        }
+
+        // 最良角 center の周辺 ±coarse/2 を細かく刻んだ角度リスト。近い角から順に返す
+        function fineList(it, center, coarse) {
+            var half = coarse / 2, st = opt.fine;
+            if (st < it.minStep) st = it.minStep;            // 解像度以下には刻まない
+            if (half / st > FINE_MAX / 2) st = half / (FINE_MAX / 2); // 本数を上限内に収める
+            if (st > half) return null;
+            var list = [];
+            for (var d = st; d <= half + 1e-9; d += st) { list.push(center - d); list.push(center + d); }
+            return list.length ? list : null;
+        }
+
+        var items = [], m0 = modes[0] ? 0 : 1, ri, pi;
+        for (i = 0; i < ringsList.length; i++) {
+            if (cb) cb('形状を解析中… ' + (i + 1) + ' / ' + ringsList.length);
+            var rings = ringsList[i];
+            var mnx = 1e30, mxx = -1e30, mny = 1e30, mxy = -1e30, peri = 0;
+            for (ri = 0; ri < rings.length; ri++) {
+                var rg = rings[ri], rn = rg.length;
+                for (pi = 0; pi < rn; pi++) {
+                    var px = rg[pi][0], py = rg[pi][1];
+                    if (px < mnx) mnx = px; if (px > mxx) mxx = px;
+                    if (py < mny) mny = py; if (py > mxy) mxy = py;
+                    var qx = rg[(pi + 1) % rn][0] - px, qy = rg[(pi + 1) % rn][1] - py;
+                    peri += Math.sqrt(qx * qx + qy * qy);
+                }
+            }
+            var dx = mxx - mnx, dy = mxy - mny, diag = Math.sqrt(dx * dx + dy * dy);
+            var it = { rings: rings, cache: {}, shape: {}, n: 0, area: 0,
+                       // この部品でマスクが変わる最小角度 2s/L。これ未満に刻んでも結果は同じ
+                       minStep: diag > 0 ? 2 * s / diag * DEG : 360,
+                       // 配置順のキー。細長い部品は面積が小さくても周長が大きい
+                       m: { peri: peri, bbox: dx * dy, maxDim: dx > dy ? dx : dy, diag: diag, area: 0 } };
+            getMask(it, m0, 0);   // 面積を確定させ、角度0のマスクを先に作っておく
+            it.m.area = it.area;
             items.push(it);
         }
 
-        var base = [];
-        for (i = 0; i < items.length; i++) base.push(i);
-        base.sort(function (x, y) { return items[y].area - items[x].area; });
+        var ctx = { angles: angles, step: opt.step, scan: scan, fineList: fineList,
+                    refine: !!opt.refine && opt.step < 360 };
 
-        var best = null;
-        for (var t = 0; t < opt.trials; t++) {
-            if (cb) cb('配置を計算中… 試行 ' + (t + 1) + ' / ' + opt.trials);
-            var order = base.slice(0);
-            if (t > 0) perturb(order);
+        var plans = buildPlans(items, opt), best = null, bestPlan = null;
+        for (var t = 0; t < plans.length; t++) {
+            if (cb) cb('配置を計算中… ' + (t + 1) + ' / ' + plans.length + '（' + plans[t].label + '）');
             var bins = [];
             for (f = 0; f < defs.length; f++) bins.push(makeBin(defs[f].b, defs[f].mode, s, opt.margin, Ri));
-            var res = nestOnce(order, items, bins);
-            if (!best || res.cost < best.cost) best = res;
+            var res = nestOnce(plans[t].order, items, bins, ctx);
+            if (!best || res.cost < best.cost) { best = res; bestPlan = plans[t]; }
         }
 
         // 配置結果を「回転角・回転後の左上座標（ドキュメント座標）」に変換
@@ -288,13 +370,15 @@ var DN = (function () {
         for (i = 0; i < items.length; i++) {
             var pc = best.place[i];
             if (!pc) { out.push(null); continue; }
-            var mk = items[i].masks[pc.bin.mode][pc.o];
+            var mk = pc.mk;
             var minP = pc.bin.GP + (pc.p + mk.off) * s, minQ = pc.bin.GQ + (pc.q + mk.off) * s;
             var left, top;
             if (pc.bin.mode === 0) { left = minP; top = -minQ; } else { top = -minP; left = minQ; }
-            out.push({ angle: angles[pc.o], left: left, top: top, frame: pc.binIndex });
+            out.push({ angle: mk.ang, left: left, top: top, frame: pc.binIndex });
         }
-        return { result: out, unplaced: best.nUn };
+        return { result: out, unplaced: best.nUn, binsUsed: best.binsUsed,
+                 used: Math.max(0, (best.far - 2 * Ri) * s),
+                 order: bestPlan ? bestPlan.label : '', tried: plans.length };
     }
 
     return { nest: nest, rasterize: rasterize, dilate: dilate };
@@ -422,10 +506,18 @@ var DN = (function () {
     }
 
     // ---- ダイアログ ----
-    var ROT_LABELS = ['回転なし', '180°', '90°', '45°', '30°', '15°', '10°'];
-    var ROT_STEPS = [360, 180, 90, 45, 30, 15, 10];
+    // 回転は常に全周 360°。下の値はその刻み幅
+    var ROT_LABELS = ['回転なし', '180°ごと', '90°ごと', '45°ごと', '30°ごと', '15°ごと', '10°ごと', '5°ごと', '2°ごと'];
+    var ROT_STEPS = [360, 180, 90, 45, 30, 15, 10, 5, 2];
     var GRID_LABELS = ['2.0 mm（速い）', '1.0 mm（標準）', '0.5 mm（精密・遅い）'];
     var GRID_VALUES = [2, 1, 0.5];
+    var FINE_LABELS = ['2°', '1°', '0.5°'];
+    var FINE_VALUES = [2, 1, 0.5];
+    // 配置順。細長い部品は面積が小さく後回しにされるため、既定は周長順
+    var ORDER_LABELS = ['周長（推奨）', '面積', '最大寸法', '外接矩形', '対角長', '自動（全部試す）'];
+    var ORDER_VALUES = ['peri', 'area', 'maxDim', 'bbox', 'diag', 'auto'];
+    var DEPTH_LABELS = ['1 通り', '先頭繰り上げも試す'];
+    var DEPTH_VALUES = [1, 2];
 
     var dlg = new Window('dialog', 'デカール自動配置');
     dlg.orientation = 'column';
@@ -451,20 +543,34 @@ var DN = (function () {
     var gRot = pnl.add('group');
     var lb3 = gRot.add('statictext', undefined, '回転'); lb3.preferredSize.width = 64;
     var ddRot = gRot.add('dropdownlist', undefined, ROT_LABELS); ddRot.selection = 5;
+    gRot.add('statictext', undefined, '（全周360°をこの刻みで試す。反転なし）');
+
+    var gFine = pnl.add('group');
+    var lb6 = gFine.add('statictext', undefined, '仕上げ'); lb6.preferredSize.width = 64;
+    var cbFine = gFine.add('checkbox', undefined, '最良角の周辺を'); cbFine.value = true;
+    var ddFine = gFine.add('dropdownlist', undefined, FINE_LABELS); ddFine.selection = 2;
+    gFine.add('statictext', undefined, '刻みで再探索');
 
     var gGrid = pnl.add('group');
     var lb4 = gGrid.add('statictext', undefined, '精度'); lb4.preferredSize.width = 64;
     var ddGrid = gGrid.add('dropdownlist', undefined, GRID_LABELS); ddGrid.selection = 1;
 
-    var gTry = pnl.add('group');
-    var lb5 = gTry.add('statictext', undefined, '試行回数'); lb5.preferredSize.width = 64;
-    var etTry = gTry.add('edittext', undefined, '3'); etTry.characters = 5;
-    gTry.add('statictext', undefined, '（多いほど詰まりやすいが遅い）');
+    var gOrd = pnl.add('group');
+    var lb5 = gOrd.add('statictext', undefined, '配置順'); lb5.preferredSize.width = 64;
+    var ddOrd = gOrd.add('dropdownlist', undefined, ORDER_LABELS); ddOrd.selection = 0;
+    gOrd.add('statictext', undefined, 'が大きい順に置く');
+
+    var gDepth = pnl.add('group');
+    var lb7 = gDepth.add('statictext', undefined, '探索'); lb7.preferredSize.width = 64;
+    var ddDep = gDepth.add('dropdownlist', undefined, DEPTH_LABELS); ddDep.selection = 0;
+
+    var warn = pnl.add('statictext', undefined, '', { multiline: true });
+    warn.preferredSize = [360, 30];
 
     var cbAuto = pnl.add('checkbox', undefined, 'スライダーを離したら自動で再配置');
 
     var status = dlg.add('statictext', undefined, '「配置」を押すと計算を開始します。', { multiline: true });
-    status.preferredSize = [380, 48];
+    status.preferredSize = [380, 78];
 
     var gBtn = dlg.add('group');
     gBtn.alignment = 'right';
@@ -475,6 +581,24 @@ var DN = (function () {
     function snap(v) { return Math.round(v * 2) / 2; }
     function num(txt, def) { var v = parseFloat(txt); return (isNaN(v) || v < 0) ? def : v; }
     function setStatus(t) { status.text = t; try { dlg.update(); } catch (e) {} }
+
+    cbFine.onClick = function () { ddFine.enabled = cbFine.value; };
+
+    // 試す並び順の数。自動や深い探索を選ぶと一気に増えるので、押す前に知らせる
+    function planCount() {
+        var keys = ORDER_VALUES[ddOrd.selection.index] === 'auto' ? 5 : 1;
+        return keys * (DEPTH_VALUES[ddDep.selection.index] > 1 ? parts.length : 1);
+    }
+    function updateWarn() {
+        var n = planCount();
+        warn.text = n <= 1 ? '並び順 1 通りを計算します。'
+            : '※ 並び順を ' + n + ' 通り試します。パーツ数によっては数分かかり、'
+            + '計算中は操作を受け付けません。';
+        try { dlg.update(); } catch (e) {}
+    }
+    ddOrd.onChange = updateWarn;
+    ddDep.onChange = updateWarn;
+    updateWarn();
 
     sl.onChanging = function () { etGap.text = snap(sl.value); };
     sl.onChange = function () {
@@ -494,7 +618,10 @@ var DN = (function () {
             margin: num(etMar.text, 0) * MM,
             step: ROT_STEPS[ddRot.selection.index],
             s: GRID_VALUES[ddGrid.selection.index] * MM,
-            trials: Math.max(1, Math.round(num(etTry.text, 1)))
+            refine: cbFine.value,
+            fine: FINE_VALUES[ddFine.selection.index],
+            order: ORDER_VALUES[ddOrd.selection.index],
+            depth: DEPTH_VALUES[ddDep.selection.index]
         };
         var t0 = new Date().getTime();
         try {
@@ -527,6 +654,9 @@ var DN = (function () {
 
             var sec = ((new Date().getTime() - t0) / 1000).toFixed(1);
             var msg = '配置: ' + (parts.length - unplaced.length) + ' / ' + parts.length + ' 個（' + sec + ' 秒）';
+            msg += '\n使用枠 ' + res.binsUsed + ' / ' + frames.length
+                 + ' ・最終枠の使用長 ' + (res.used / MM).toFixed(1) + ' mm（小さいほど詰まっている）';
+            msg += '\n採用した配置順: ' + res.order + '（' + res.tried + ' 通りから選択）';
             if (unplaced.length) msg += '\n入りきらなかった ' + unplaced.length + ' 個は元の位置に戻して選択しています。';
             setStatus(msg);
         } catch (e) {
